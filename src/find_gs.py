@@ -15,6 +15,7 @@ from typing import Optional, Any, Callable, Tuple, List
 
 import tensorcircuit as tc
 import tensorcircuit.quantum as qu
+import tensorcircuit.noisemodel as noisemodel
 from tensorcircuit.templates.measurements import operator_expectation, sparse_expectation
 from jax import config
 from tqdm import tqdm
@@ -166,7 +167,7 @@ class VariationalAnsatz(abc.ABC):
             
             if self.perform_noisy_simulations:
                 # Setup noise configuration
-                noise_conf = tc.noisemodel.NoiseConf()
+                noise_conf = noisemodel.NoiseConf()
                 noise_conf.add_noise("depolarizing", [self.noise_rate*0.1],
                                     ["x", "y", "z", "h", "s", "t", "rx", "ry", "rz"])
                 noise_conf.add_noise("depolarizing", [self.noise_rate],
