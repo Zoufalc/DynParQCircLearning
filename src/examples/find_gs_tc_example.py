@@ -63,7 +63,8 @@ if __name__ == "__main__":
         sparse=False,
         perform_noisy_simulations=True,
         noise_rate=5e-2,
-        number_of_shots=2000
+        number_of_shots=2000,
+        max_trials_in_batch=1
         )
     final_energies, final_parameters, all_energy_values, all_purity_values = ansatz.optimize(save_results=True)
     print('final energies ', final_energies)

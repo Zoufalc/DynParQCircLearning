@@ -8,19 +8,19 @@
 import abc
 import sys
 from functools import partial
-
-from scipy.optimize import minimize
 from dataclasses import dataclass, field
 from typing import Optional, Any, Callable, Tuple, List
 
+import numpy as np
+import jax
+from jax import numpy as jnp
+from jax import config
+config.update("jax_enable_x64", True)
+
 import tensorcircuit as tc
 import tensorcircuit.quantum as qu
-import tensorcircuit.noisemodel as noisemodel
-from tensorcircuit.templates.measurements import operator_expectation, sparse_expectation
-from jax import config
-from tqdm import tqdm
-config.update("jax_enable_x64", True)
-from jax import numpy as jnp
+from tensorcircuit.templates.measurements import sparse_expectation
+
 import cotengra as ctg
 optr = ctg.ReusableHyperOptimizer(
     methods=["greedy"],
@@ -31,8 +31,9 @@ optr = ctg.ReusableHyperOptimizer(
     progbar=True,
     directory=True,
 )
+import optax
 import warnings
-warnings.filterwarnings("ignore", message=".*The inputs or output of this tree are not ordered.*")
+from tqdm import tqdm
 
 def opt_reconf(inputs, output, size, **kws):
     tree = optr.search(inputs, output, size)
@@ -44,12 +45,13 @@ def opt_reconf(inputs, output, size, **kws):
 K = tc.set_backend("jax")
 tc.set_contractor("custom", optimizer=optr, preprocessing=True)
 
-import optax
+warnings.filterwarnings(
+    "ignore", message=".*The inputs or output of this tree are not ordered.*"
+)
 
-from src.utilities.generate_ansatz import *
-from src.utilities.result_saver import ResultSaver
+HamiltonianTerm = Tuple[Tuple[Any, List[int]], float]
 
-def _make_jit_helpers(ansatz: Any) -> Tuple[Callable, Callable]:
+def _make_jit_helpers(ansatz):
     """
     Create JIT helpers for a class implementing `energy_from_params`:
 
@@ -59,26 +61,32 @@ def _make_jit_helpers(ansatz: Any) -> Tuple[Callable, Callable]:
     This function captures necessary data from ansatz without passing the entire
     object to JIT, preventing recompilation on every call.
     """
-    energy_fn = ansatz.energy_from_params
-    perform_noisy_simulations = getattr(ansatz, "perform_noisy_simulations", False)
-    
-    if perform_noisy_simulations:
-        # For noisy simulations, we need to handle seeds
-        def energy_with_seed(params, seed):
-            return energy_fn(params, seed=seed)
-        
-        costs_vmapped = K.jit(K.vmap(energy_with_seed, vectorized_argnums=[0, 1]))
-        cost_vvag = K.jit(K.vmap(K.value_and_grad(energy_with_seed, argnums=0),
-                                 vectorized_argnums=[0, 1]))
-    else:
-        # For noiseless simulations
-        costs_vmapped = K.jit(K.vmap(energy_fn, vectorized_argnums=0))
-        cost_vvag = K.jit(K.vmap(K.value_and_grad(energy_fn, argnums=0),
-                                 vectorized_argnums=0))
-    
-    return costs_vmapped, cost_vvag
 
-HamiltonianTerm = Tuple[Tuple[Any, List[int]], float]
+    energy_fn = ansatz.energy_from_params
+
+    if ansatz.perform_noisy_simulations:
+        def wrapped(params, key):
+            return energy_fn(params, key)
+
+        costs_vmapped = K.jit(
+            K.vmap(wrapped, vectorized_argnums=[0, 1]),
+            static_argnums=(),
+        )
+
+        cost_vvag = K.jit(
+            K.vmap(K.value_and_grad(wrapped), vectorized_argnums=[0, 1]),
+            static_argnums=(),
+        )
+    else:
+        costs_vmapped = K.jit(
+            K.vmap(energy_fn, vectorized_argnums=[0])
+        )
+
+        cost_vvag = K.jit(
+            K.vmap(K.value_and_grad(energy_fn), vectorized_argnums=[0])
+        )
+
+    return costs_vmapped, cost_vvag
 
 @dataclass(eq=False)
 class VariationalAnsatz(abc.ABC):
@@ -101,6 +109,7 @@ class VariationalAnsatz(abc.ABC):
     howoften_tosave: int = 10       # checkpoint frequency
     learning_rate: float = 1e-2     # Adam learning rate
     sparse: bool = True             # work with the sparse Hamiltonian representation
+    max_trials_in_batch: Optional[int] = None  # max trials to vmap over at once (None = all trials)
     
     # Noise simulation parameters
     perform_noisy_simulations: bool = False
@@ -141,55 +150,61 @@ class VariationalAnsatz(abc.ABC):
         self._costs_vmapped, self._cost_vvag = _make_jit_helpers(self)
 
     def _initialise_parameters(self):
-        """Initialize random parameters for all trials."""
-        randint = np.random.randint(1e5)
-        key = jax.random.PRNGKey(randint)
-        return jax.random.uniform(key, shape=[self.trials, self.nparams],
-                                 minval=0, maxval=jnp.pi)
+        key = jax.random.PRNGKey(np.random.randint(1e6))
+        return jax.random.uniform(
+            key,
+            shape=(self.trials, self.nparams),
+            minval=0.0,
+            maxval=jnp.pi,
+        )
 
-    def energy_from_params(self, params, seed=None) -> Any:
-        """Compute energy for given parameters."""
-        qc = self._circuit(params, seed)
-        
+    def energy_from_params(self, params, key=None):
+        qc = self._circuit(params)
+
         if self.sparse:
-            # Warn if noise is requested with sparse mode
-            if self.perform_noisy_simulations:
-                warnings.warn(
-                    "Noisy simulations are not supported with sparse=True. "
-                    "Set sparse=False to enable noisy simulations.",
-                    UserWarning
-                )
             return K.real(sparse_expectation(qc, self.fullham))
-        else:
-            # Non-sparse: compute expectation values term by term
-            terms = self._hamiltonian_terms()
-            energy = 0.0
-            
-            if self.perform_noisy_simulations:
-                # Setup noise configuration
-                noise_conf = noisemodel.NoiseConf()
-                noise_conf.add_noise("depolarizing", [self.noise_rate*0.1],
-                                    ["x", "y", "z", "h", "s", "t", "rx", "ry", "rz"])
-                noise_conf.add_noise("depolarizing", [self.noise_rate],
-                                    ["cnot", "cz", "swap", "iswap", "rxx", "ryy", "rzz"])
-                
-                nmc = self.number_of_shots
-                if seed is not None:
-                    K.set_random_state(seed)
-                
-                for ops, coeff in terms:
-                    status = K.random_uniform(shape=[nmc], boundaries=(0.0, 1.0))
-                    exp_val = tc.noisemodel.expectation_noisfy(
-                        qc, *ops, noise_conf=noise_conf, nmc=nmc, status=status
-                    )
-                    energy += coeff * exp_val
-            else:
-                # Noiseless simulation
-                for ops, coeff in terms:
-                    exp_val = qc.expectation(*ops)
-                    energy += coeff * exp_val
-            
+
+        terms = self._hamiltonian_terms()
+        energy = 0.0
+
+        if not self.perform_noisy_simulations:
+            for ops, coeff in terms:
+                energy = energy + coeff * qc.expectation(*ops)
             return K.real(energy)
+
+        # -------- noisy simulation --------
+
+        nmc = self.number_of_shots
+        noise_conf = tc.noisemodel.NoiseConf()
+        noise_conf.add_noise(
+            "depolarizing",
+            [self.noise_rate * 0.1],
+            ["x", "y", "z", "h", "s", "t", "rx", "ry", "rz"],
+        )
+        noise_conf.add_noise(
+            "depolarizing",
+            [self.noise_rate],
+            ["cnot", "cz", "swap", "iswap", "rxx", "ryy", "rzz"],
+        )
+
+        assert key is not None, "PRNGKey required for noisy simulations"
+
+        # Pre-split keys for all terms to avoid splitting inside vmap
+        num_terms = len(terms)
+        keys = jax.random.split(key, num_terms)
+        
+        for idx, (ops, coeff) in enumerate(terms):
+            status = jax.random.uniform(keys[idx], shape=(nmc,))
+            exp_val = tc.noisemodel.expectation_noisfy(
+                qc,
+                *ops,
+                noise_conf=noise_conf,
+                nmc=nmc,
+                status=status,
+            )
+            energy = energy + coeff * exp_val
+
+        return K.real(energy)
 
     def purity_from_params(self, params):
         """
@@ -235,33 +250,67 @@ class VariationalAnsatz(abc.ABC):
         params = jnp.array(self.initparams)
         self.allpurities = np.zeros((self.trials, 1 + (self.maxiter - 1) // self.howoften_tosave))
         self.allenergies = np.zeros((self.trials, 1 + (self.maxiter - 1) // self.howoften_tosave))
-        counter = 0
-        optimizer = optax.adam(learning_rate=self.learning_rate)
-        opt_state = optimizer.init(params)
-
-        # Initialize random seeds for noisy simulations
-        if self.perform_noisy_simulations:
-            base_seed = 42
-            all_seeds = jnp.arange(self.maxiter * self.trials).reshape(self.maxiter, self.trials) + base_seed
         
-        with tqdm(range(self.maxiter), miniters=self.howoften_tosave, mininterval=1) as pbar:
-            for i in pbar:
-                if self.perform_noisy_simulations:
-                    seeds = all_seeds[i]
-                    value, gradient = self._cost_vvag(params, seeds)
-                else:
-                    value, gradient = self._cost_vvag(params)
-                
-                updates, opt_state = optimizer.update(gradient, opt_state)
-                params = optax.apply_updates(params, updates)
-                
-                if i % self.howoften_tosave == 0:
-                    self.allenergies[:, counter] = value
-                    if track_purity:
-                        self.allpurities[:, counter] = purity_vec(self, params)
-                    counter += 1
-                    pbar.set_postfix_str(f"Current value: {str(jnp.min(value))}")
+        batch_size = self.max_trials_in_batch or self.trials
+        n_batches = (self.trials + batch_size - 1) // batch_size
 
+        master_key = jax.random.PRNGKey(42)
+        # Create keys for each iteration and trial
+        # jax.random.split returns shape (n, 2), so we reshape to (maxiter, trials, 2)
+        all_keys = jax.random.split(master_key, self.maxiter * self.trials)
+        key_matrix = all_keys.reshape(self.maxiter, self.trials, 2)
+
+        for batch_idx in range(n_batches):
+            start_idx, end_idx = batch_idx * batch_size, min((batch_idx + 1) * batch_size, self.trials)
+            batch_params = params[start_idx:end_idx]
+            optimizer = optax.adam(self.learning_rate)
+            opt_state = optimizer.init(batch_params)
+
+            counter = 0
+            with tqdm(range(self.maxiter)) as pbar:
+                for i in pbar:
+                    if self.perform_noisy_simulations:
+                        keys = key_matrix[i, start_idx:end_idx, :]
+                        values, gradients = self._cost_vvag(batch_params, keys)
+                    else:
+                        values, gradients = self._cost_vvag(batch_params)
+
+                    updates, opt_state = optimizer.update(gradients, opt_state)
+                    batch_params = optax.apply_updates(batch_params, updates)
+
+                    if i % self.howoften_tosave == 0:
+                        self.allenergies[start_idx:end_idx, counter] = values
+                        if track_purity:
+                            self.allpurities[start_idx:end_idx, counter] = purity_vec(self, batch_params)
+                        counter += 1
+
+                    pbar.set_postfix_str(f"min(E)={float(jnp.min(values)):.6f}")
+
+            params = params.at[start_idx:end_idx].set(batch_params)
+
+        # Evaluate final energies in batches to avoid OOM errors
+        if self.max_trials_in_batch is not None and self.trials > self.max_trials_in_batch:
+            # Batch evaluation to prevent memory issues
+            value = jnp.zeros(self.trials)
+            for batch_start in range(0, self.trials, self.max_trials_in_batch):
+                batch_end = min(batch_start + self.max_trials_in_batch, self.trials)
+                batch_params = params[batch_start:batch_end]
+                
+                if self.perform_noisy_simulations:
+                    batch_keys = key_matrix[-1, batch_start:batch_end, :]
+                    batch_value = self._costs_vmapped(batch_params, batch_keys)
+                else:
+                    batch_value = self._costs_vmapped(batch_params)
+                
+                value = value.at[batch_start:batch_end].set(batch_value)
+        else:
+            # Original single evaluation for small trial counts
+            if self.perform_noisy_simulations:
+                final_keys = key_matrix[-1, :, :]
+                value = self._costs_vmapped(params, final_keys)
+            else:
+                value = self._costs_vmapped(params)
+        
         # Optionally save results
         if save_results:
             self.save_results(value, params, self.allenergies, self.allpurities)
